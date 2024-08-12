@@ -15,10 +15,20 @@ from torch.utils.tensorboard import SummaryWriter
 
 from model.LISA import LISAForCausalLM
 from model.llava import conversation as conversation_lib
-from utils.dataset import HybridDataset, ValDataset, collate_fn
-from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
-                         AverageMeter, ProgressMeter, Summary, dict_to_cuda,
-                         intersectionAndUnionGPU)
+from utils.dataset import (
+    HybridDataset,
+    ValDataset,
+    custom_collate_fn_grouped as collate_fn,
+)
+from utils.utils import (
+    DEFAULT_IM_END_TOKEN,
+    DEFAULT_IM_START_TOKEN,
+    AverageMeter,
+    ProgressMeter,
+    Summary,
+    dict_to_cuda,
+    intersectionAndUnionGPU,
+)
 
 
 def parse_args(args):
@@ -36,7 +46,7 @@ def parse_args(args):
         help="precision for inference",
     )
     parser.add_argument("--image_size", default=1024, type=int, help="image size")
-    parser.add_argument("--model_max_length", default=512, type=int)
+    parser.add_argument("--model_max_length", default=2111, type=int)
     parser.add_argument("--lora_r", default=8, type=int)
     parser.add_argument(
         "--vision-tower", default="openai/clip-vit-large-patch14", type=str
@@ -45,9 +55,11 @@ def parse_args(args):
     parser.add_argument("--load_in_4bit", action="store_true", default=False)
 
     parser.add_argument(
-        "--dataset", default="sem_seg||refer_seg||vqa||reason_seg", type=str
+        "--dataset",
+        default="sem_seg||refer_seg||vqa||reason_seg||multi_img_seg",
+        type=str,
     )
-    parser.add_argument("--sample_rates", default="9,3,3,1", type=str)
+    parser.add_argument("--sample_rates", default="9,3,3,1,1,1", type=str)
     parser.add_argument(
         "--sem_seg_data",
         default="ade20k||cocostuff||pascal_part||paco_lvis||mapillary",
@@ -58,6 +70,11 @@ def parse_args(args):
     )
     parser.add_argument("--vqa_data", default="llava_instruct_150k", type=str)
     parser.add_argument("--reason_seg_data", default="ReasonSeg|train", type=str)
+    parser.add_argument(
+        "--multi_img_seg_data",
+        default="ade20k_part234||part_image_net||paco_lvis",
+        type=str,
+    )
     parser.add_argument("--val_dataset", default="ReasonSeg|val", type=str)
     parser.add_argument("--dataset_dir", default="./dataset", type=str)
     parser.add_argument("--log_base_dir", default="./runs", type=str)
@@ -84,7 +101,7 @@ def parse_args(args):
     parser.add_argument("--explanatory", default=0.1, type=float)
     parser.add_argument("--beta1", default=0.9, type=float)
     parser.add_argument("--beta2", default=0.95, type=float)
-    parser.add_argument("--num_classes_per_sample", default=3, type=int)
+    parser.add_argument("--num_classes_per_sample", default=4, type=int)
     parser.add_argument("--exclude_val", action="store_true", default=False)
     parser.add_argument("--no_eval", action="store_true", default=False)
     parser.add_argument("--eval_only", action="store_true", default=False)
@@ -102,6 +119,9 @@ def parse_args(args):
         default="llava_v1",
         type=str,
         choices=["llava_v1", "llava_llama_2"],
+    )
+    parser.add_argument(
+        "--multi_image_filepath_prefix", default="mixed_parts", type=str
     )
     return parser.parse_args(args)
 
@@ -248,6 +268,7 @@ def main(args):
         vqa_data=args.vqa_data,
         reason_seg_data=args.reason_seg_data,
         explanatory=args.explanatory,
+        multi_image_filepath_prefix=args.multi_image_filepath_prefix,
     )
 
     if args.no_eval == False:

@@ -10,8 +10,7 @@ from pycocotools import mask
 from transformers import CLIPImageProcessor
 
 from model.llava import conversation as conversation_lib
-from model.llava.constants import (DEFAULT_IMAGE_TOKEN, IGNORE_INDEX,
-                                   IMAGE_TOKEN_INDEX)
+from model.llava.constants import DEFAULT_IMAGE_TOKEN, IGNORE_INDEX, IMAGE_TOKEN_INDEX
 from model.llava.mm_utils import tokenizer_image_token
 from model.segment_anything.utils.transforms import ResizeLongestSide
 
@@ -21,9 +20,10 @@ from .reason_seg_dataset import ReasonSegDataset
 from .refer import REFER
 from .refer_seg_dataset import ReferSegDataset
 from .sem_seg_dataset import SemSegDataset
-from .utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
-                    DEFAULT_IMAGE_TOKEN)
+from .utils import DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IMAGE_TOKEN
 from .vqa_dataset import VQADataset
+from .MultiImage_Object_Comparison_dataset import MultiImageObjectComparisonDataset
+from .MultiImage_Part_Comparison_dataset import MultiImagePartComparisonDataset
 
 
 def collate_fn(
@@ -160,6 +160,191 @@ def collate_fn(
     }
 
 
+def _process_conversation(conversation, target, tokenizer, sep, sep2):
+    total_len = target.ne(tokenizer.pad_token_id).sum().item()
+    rounds = conversation.split(sep2)
+    cur_len = 1
+    target[:cur_len] = IGNORE_INDEX
+
+    for rou in rounds:
+        if not rou:
+            break
+
+        parts = rou.split(sep)
+        # assert len(parts) == 2, (len(parts), rou)
+        if len(parts) == 1:
+            if DEFAULT_IMAGE_TOKEN in conversation:
+                round_len = len(tokenizer_image_token(rou, tokenizer)) - 1
+            else:
+                round_len = len(tokenizer(rou).input_ids) - 1
+            target[cur_len : cur_len + round_len] = IGNORE_INDEX
+            cur_len += round_len
+            continue
+        parts[0] += sep
+
+        if DEFAULT_IMAGE_TOKEN in conversation:
+            round_len = len(tokenizer_image_token(rou, tokenizer))
+            instruction_len = len(tokenizer_image_token(parts[0], tokenizer)) - 2
+        else:
+            round_len = len(tokenizer(rou).input_ids)
+            instruction_len = len(tokenizer(parts[0]).input_ids) - 2
+
+        target[cur_len : cur_len + instruction_len] = IGNORE_INDEX
+        cur_len += round_len
+
+    target[cur_len:] = IGNORE_INDEX
+    if cur_len < tokenizer.model_max_length:
+        assert cur_len == total_len, f"{cur_len = }, {total_len = }"
+
+
+def custom_collate_fn_grouped(
+    batch, tokenizer=None, use_mm_start_end=True, inference=False, local_rank=-1
+):
+    # Initializing lists and counters
+    image_path_list, global_enc_image_list, grounding_enc_image_list = [], [], []
+    correspondence_feats_list = []
+    bboxes_list, conversation_list, masks_list = [], [], []
+    label_list, resize_list, questions_list = [], [], []
+    selected_labels_list, offset_list, img_offset_list, inferences = [], [0], [0], []
+    cnt = 0
+    img_cnt = 0
+
+    if len(batch) > 1:
+        print(
+            "Warning: batch size should be 1 for this collate function. Instead got "
+            f"inner_batch_size = {len(batch[0])} and batch_size = {len(batch)}. Only "
+            "first element in batch processes, discarding others."
+        )
+
+    # Iterating through the batch
+    for (
+        image_path,
+        global_enc_image,
+        grounding_enc_image,
+        bboxes,
+        conversations,
+        masks,
+        label,
+        resize,
+        questions,
+        sampled_classes,
+    ) in batch[0]:
+        correspondence_feats = None
+        if isinstance(global_enc_image, (tuple, list)):
+            global_enc_image, correspondence_feats = global_enc_image
+        if image_path is None:
+            image_path = []
+        elif not isinstance(image_path, (tuple, list)):
+            image_path = [image_path]
+            global_enc_image = global_enc_image.unsqueeze(0)
+            if correspondence_feats is not None:
+                correspondence_feats = correspondence_feats.unsqueeze(0)
+            grounding_enc_image = grounding_enc_image.unsqueeze(0)
+            bboxes = [bboxes] if bboxes is not None else None
+        image_path_list.append(image_path)
+        if global_enc_image is not None:
+            global_enc_image_list.append(global_enc_image)
+        if correspondence_feats is not None:
+            correspondence_feats_list.append(correspondence_feats)
+        if grounding_enc_image is not None:
+            grounding_enc_image_list.append(grounding_enc_image)
+        bboxes_list.append(bboxes)
+        conversation_list.extend(conversations)
+        if masks is None:
+            masks_list.append(None)
+        elif isinstance(masks, (tuple, list)):
+            masks_list.append(
+                tuple((mask.float() if mask is not None else None) for mask in masks)
+            )
+        else:
+            masks_list.append(masks.float())
+        label_list.append(label)
+        resize_list.append(resize)
+        questions_list.append(questions)
+        selected_labels_list.append(sampled_classes)
+        offset_list.append(cnt := cnt + len(conversations))
+        if global_enc_image is not None:
+            img_offset_list.append(img_cnt := img_cnt + global_enc_image.shape[0])
+        else:
+            img_offset_list.append(img_cnt)
+        inferences.append(inference)
+
+    # Handling the conversation list
+    if use_mm_start_end:
+        replace_token = (
+            DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
+        )
+        conversation_list = [
+            conv.replace(DEFAULT_IMAGE_TOKEN, replace_token)
+            for conv in conversation_list
+        ]
+
+    # Tokenizing and padding input ids
+    input_ids = torch.nn.utils.rnn.pad_sequence(
+        [
+            tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
+            for prompt in conversation_list
+        ],
+        batch_first=True,
+        padding_value=tokenizer.pad_token_id,
+    )
+    attention_masks = input_ids.ne(tokenizer.pad_token_id)
+
+    # Preparing targets and handling conversation types
+    conv = conversation_lib.default_conversation.copy()
+    targets = input_ids.clone()
+    # conv_type == "llava_v1"
+    sep = conv.sep + conv.roles[1] + ": "
+    sep2 = conv.sep2
+
+    for conversation, target in zip(conversation_list, targets):
+        _process_conversation(conversation, target, tokenizer, sep, sep2)
+
+    # Adjusting for inferences
+    if not inferences[0]:
+        truncate_len = tokenizer.model_max_length - 575 * len(image_path_list[0])
+        if input_ids.shape[1] > truncate_len:
+            print(
+                f"Warning: input_ids too long ({input_ids.shape[1]}), truncating to {truncate_len}. Conversations:\n"
+                + conversation_list
+            )
+            input_ids, targets, attention_masks = map(
+                lambda x: x[:, :truncate_len], [input_ids, targets, attention_masks]
+            )
+    if len(global_enc_image_list) > 0:
+        global_enc_images_ret = torch.stack(global_enc_image_list, dim=0)
+    else:
+        global_enc_images_ret = None
+
+    if len(correspondence_feats_list) > 0 and correspondence_feats_list[0] is not None:
+        global_enc_images_ret = (
+            global_enc_images_ret,
+            torch.stack(correspondence_feats_list, dim=0),
+        )
+
+    return {
+        "image_paths": image_path_list,
+        "images": (
+            None
+            if len(grounding_enc_image_list) == 0 or grounding_enc_image_list[0] is None
+            else torch.stack(grounding_enc_image_list, dim=0)
+        ),
+        "images_clip": global_enc_images_ret,
+        "input_ids": input_ids,
+        "labels": targets,
+        "attention_masks": attention_masks,
+        "masks_list": None if masks_list[0] is None else masks_list,
+        "label_list": None if label_list[0] is None else label_list,
+        "resize_list": None if resize_list[0] is None else resize_list,
+        "offset": torch.LongTensor(offset_list),
+        "image_offset": torch.LongTensor(img_offset_list),
+        "questions_list": questions_list,
+        "sampled_classes_list": selected_labels_list,
+        "inference": inferences[0],
+        "conversation_list": conversation_list,
+    }
+
+
 class HybridDataset(torch.utils.data.Dataset):
     pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
     pixel_std = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
@@ -176,13 +361,15 @@ class HybridDataset(torch.utils.data.Dataset):
         image_size: int = 224,
         num_classes_per_sample: int = 3,
         exclude_val=False,
-        dataset="sem_seg||refer_seg||vqa||reason_seg",
+        dataset="sem_seg||refer_seg||vqa||reason_seg||multi_img_seg",
         sample_rate=[9, 3, 3, 1],
         sem_seg_data="ade20k||cocostuff||partimagenet||pascal_part||paco_lvis||mapillary",
         refer_seg_data="refclef||refcoco||refcoco+||refcocog",
+        multi_img_seg_data="ade20k_part234||part_image_net||paco_lvis",
         vqa_data="llava_instruct_150k",
         reason_seg_data="ReasonSeg|train",
         explanatory=0.1,
+        multi_image_filepath_prefix="",
     ):
         self.exclude_val = exclude_val
         self.dataset = dataset
@@ -256,6 +443,35 @@ class HybridDataset(torch.utils.data.Dataset):
                         exclude_val,
                         reason_seg_data,
                         explanatory,
+                    )
+                )
+            elif dataset == "multi_img_seg":
+                self.all_datasets.append(
+                    MultiImageObjectComparisonDataset(
+                        base_image_dir,
+                        tokenizer,
+                        vision_tower,
+                        samples_per_epoch,
+                        precision,
+                        image_size,
+                        num_classes_per_sample,
+                        multi_img_seg_data,
+                        multi_image_filepath_prefix=multi_image_filepath_prefix,
+                        mode="train",
+                    )
+                )
+                self.all_datasets.append(
+                    MultiImagePartComparisonDataset(
+                        base_image_dir,
+                        tokenizer,
+                        vision_tower,
+                        samples_per_epoch,
+                        precision,
+                        image_size,
+                        num_classes_per_sample,
+                        multi_img_seg_data,
+                        multi_image_filepath_prefix=multi_image_filepath_prefix,
+                        mode="train",
                     )
                 )
 

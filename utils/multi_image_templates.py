@@ -1,0 +1,122 @@
+multi_image_id_object_templates = [
+    "Can you identify and segment the objects in these images?",
+    "Please identify and segment the objects in these photos.",
+    "What are the objects in these photos? Please respond with segmentation masks.",
+    "What are the objects in these images? Please output segmentation masks.",
+    "Could you provide segmentation masks for the objects in these photos?",
+    "Please identify and segment the objects in these images.",
+    "What and where are the objects in these pictures? Please respond with segmentation masks.",
+    "Can you identify and highlight the objects in these pictures with segmentation masks?",
+]
+
+
+# fmt: off
+multi_image_common_object_templates = [
+    "Can you segment the common object in these images?",
+    "Please segment the common object in these photos.",
+    "What is the common object in these photos? Please respond with segmentation masks.",
+    "What is the common object in these images? Please output segmentation masks.",
+    "Could you provide segmentation masks for the common object in these photos?",
+    "Please identify and segment the common object in these images.",
+    "Where is the common object in these pictures? Please respond with segmentation masks.",
+    "Can you highlight the common object in these pictures with segmentation masks?",
+    
+    "Identify and segment the shared object in these images.",
+    "Please segment the common object across these pictures.",
+    "What common object do you see in these images? Respond with segmentation masks.",
+    "Segment the object that appears in these images.",
+    "What is the common object in these photos? Provide segmentation masks.",
+    "Find and segment the shared object in these pictures.",
+    "Can you identify and segment the common object in these photos?",
+    "Please provide segmentation masks for the common object in these images.",
+    "Which object is common in these images? Output segmentation masks.",
+    "Segment the object that is present in these images.",
+    "Identify the common object in these photos and segment it.",
+    "Provide segmentation masks for the shared object in these images.",
+    "What is the shared object in these images? Please output segmentation masks.",
+    "Segment the recurring object in these pictures.",
+    "Find the common object in these images and provide segmentation masks.",
+    "Please segment the object that is in these images.",
+    "Identify the object common to these photos and segment it.",
+    "What is the object present in these images? Please provide segmentation masks."
+]
+
+multi_image_common_parts_templates = [
+    "Can you segment the common parts of the objects in these images?",
+    "Please segment the common parts of the objects in these photos.",
+    "What are the common parts of the objects in these photos? Please respond with segmentation masks.",
+    "What are the common parts of the objects in these images? Please output segmentation masks.",
+    "Could you provide segmentation masks for the common parts of the objects in these photos?",
+    "Please identify and segment the common parts of the objects in these images.",
+    "Where are the common parts of the objects in these pictures? Please respond with segmentation masks.",
+    "Can you highlight the common parts of the objects in these pictures with segmentation masks?",
+    
+    "Can you segment the objects' common parts in these images?",
+    "Please segment the objects' common parts in these photos.",
+    "What are the objects' common parts in these photos? Please respond with segmentation masks.",
+    "What are the objects' common parts in these images? Please output segmentation masks.",
+    "Could you provide segmentation masks for the objects' common parts in these photos?",
+    "Please identify and segment the objects' common parts in these images.",
+    "Where are the objects' common parts in these pictures? Please respond with segmentation masks.",
+    "Can you highlight the objects' common parts in these pictures with segmentation masks?",
+
+    "Identify and segment the shared parts of the objects in these images.",
+    "Please segment the common parts of the objects across these pictures.",
+    "What common parts do you see in the objects in these images? Please provide segmentation masks.",
+    "Segment the parts that are common to the objects in these images.",
+    "What are the shared parts of the objects in these photos? Provide segmentation masks.",
+    "Find and segment the common parts of the objects in these pictures.",
+    "Can you identify and segment the shared parts of the objects in these photos?",
+    "Please provide segmentation masks for the common parts of the objects in these images.",
+    "Which parts are common in the objects in these images? Respond with segmentation masks.",
+    "Segment the parts that are present in all the objects in these images.",
+    "Identify the common parts of the objects in these photos and segment them.",
+    "Provide segmentation masks for the shared parts of the objects in these images.",
+    "What are the shared parts of the objects in these images? Output segmentation masks.",
+    "Segment the recurring parts of the objects in these pictures.",
+    "Find the common parts of the objects in these images and provide segmentation masks.",
+    "Please segment the parts that are in all the objects in these images.",
+    "Identify the parts common to the objects in these photos and segment them.",
+    "What are the parts present in all the objects in these images? Please provide segmentation masks."
+]
+
+multi_image_unique_parts_templates = [
+    "Can you segment the unique parts of the objects in these images?",
+    "Please segment the unique parts of the objects in these photos.",
+    "What are the unique parts of the objects in these photos? Please respond with segmentation masks.",
+    "What are the unique parts of the objects in these images? Please output segmentation masks.",
+    "Could you provide segmentation masks for the unique parts of the objects in these photos?",
+    "Please identify and segment the unique parts of the objects in these images.",
+    "Where are the unique parts of the objects in these pictures? Please respond with segmentation masks.",
+    "Can you highlight the unique parts of the objects in these pictures with segmentation masks?",
+    
+    "Can you segment the objects' unique parts in these images?",
+    "Please segment the objects' unique parts in these photos.",
+    "What are the objects' unique parts in these photos? Please respond with segmentation masks.",
+    "What are the objects' unique parts in these images? Please output segmentation masks.",
+    "Could you provide segmentation masks for the objects' unique parts in these photos?",
+    "Please identify and segment the objects' unique parts in these images.",
+    "Where are the objects' unique parts in these pictures? Please respond with segmentation masks.",
+    "Can you highlight the objects' unique parts in these pictures with segmentation masks?",
+
+    "Identify and segment the unique parts of the objects in these images.",
+    "Please segment the distinct parts of the objects across these pictures.",
+    "What unique parts do you see in the objects in these images? Respond with segmentation masks.",
+    "Segment the parts that are unique to the objects in these images.",
+    "What are the distinct parts of the objects in these photos? Provide segmentation masks.",
+    "Find and segment the unique parts of the objects in these pictures.",
+    "Can you identify and segment the distinct parts of the objects in these photos?",
+    "Please provide segmentation masks for the unique parts of the objects in these images.",
+    "Which parts are unique in the objects in these images? Respond with segmentation masks.",
+    "Segment the parts that are distinct in all the objects in these images.",
+    "Identify the unique parts of the objects in these photos and segment them.",
+    "Provide segmentation masks for the distinct parts of the objects in these images.",
+    "What are the unique parts of the objects in these images? Please provide segmentation masks.",
+    "Segment the distinct parts of the objects in these pictures.",
+    "Find the unique parts of the objects in these images and provide segmentation masks.",
+    "Please segment the parts that are unique in all the objects in these images.",
+    "Identify the parts unique to the objects in these photos and segment them.",
+    "What are the distinct parts present in all the objects in these images? Output segmentation masks."
+]
+
+# fmt: on

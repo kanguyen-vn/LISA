@@ -5,11 +5,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import BitsAndBytesConfig, CLIPVisionModel
 
-from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
-                         DEFAULT_IMAGE_PATCH_TOKEN)
+from utils.utils import (
+    DEFAULT_IM_END_TOKEN,
+    DEFAULT_IM_START_TOKEN,
+    DEFAULT_IMAGE_PATCH_TOKEN,
+)
 
-from .llava.model.language_model.llava_llama import (LlavaLlamaForCausalLM,
-                                                     LlavaLlamaModel)
+from .llava.model.language_model.llava_llama import (
+    LlavaLlamaForCausalLM,
+    LlavaLlamaModel,
+)
 from .segment_anything import build_sam_vit_h
 
 
@@ -136,7 +141,7 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             self.bce_loss_weight = kwargs.pop("bce_loss_weight", None)
         else:
             config.mm_vision_tower = config.vision_tower
-            
+
         self.seg_token_idx = kwargs.pop("seg_token_idx")
 
         super().__init__(config)
@@ -178,12 +183,53 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         label_list: List[torch.Tensor],
         resize_list: List[tuple],
         inference: bool = False,
+        image_offset=None,
         **kwargs,
     ):
         image_embeddings = self.get_visual_embs(images)
         batch_size = image_embeddings.shape[0]
         assert batch_size == len(offset) - 1
 
+        if (
+            masks_list is not None
+            and isinstance(masks_list[0], (tuple, list))
+            and len(masks_list[0]) == 2
+        ):
+            seg_token_masks = self._create_seg_token_mask_multi(input_ids, inference)
+
+            if inference:
+                output_hidden_states = self._inference_path(
+                    input_ids,
+                    images_clip,
+                    attention_masks,
+                    image_offset,
+                )
+
+            else:
+                output, output_hidden_states = self._training_path(
+                    images_clip,
+                    input_ids,
+                    labels,
+                    attention_masks,
+                    offset,
+                    image_offset,
+                )
+
+            hidden_states, pred_embeddings = self._process_hidden_states_multi(
+                output_hidden_states, seg_token_masks, offset
+            )
+            # Generate and post-process masks
+            pred_masks = self._generate_and_postprocess_masks_multi(
+                pred_embeddings, image_embeddings, resize_list, label_list, image_offset
+            )
+
+            if inference:
+                return {
+                    "pred_masks": pred_masks,
+                    "gt_masks": masks_list,
+                }
+
+            return
         seg_token_mask = input_ids[:, 1:] == self.seg_token_idx
         seg_token_mask = torch.cat(
             [
@@ -193,8 +239,12 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             dim=1,
         )
         # hack for IMAGE_TOKEN_INDEX (we suppose that there is only one image, and it is in the front)
+
         seg_token_mask = torch.cat(
-            [torch.zeros((seg_token_mask.shape[0], 255)).bool().cuda(), seg_token_mask],
+            [
+                torch.zeros((seg_token_mask.shape[0], 255)).bool().cuda(),
+                seg_token_mask,
+            ],
             dim=1,
         )
 
@@ -336,6 +386,275 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
 
         return {
             "loss": loss,
+            "ce_loss": ce_loss,
+            "mask_bce_loss": mask_bce_loss,
+            "mask_dice_loss": mask_dice_loss,
+            "mask_loss": mask_loss,
+        }
+
+    def _create_seg_token_mask_multi(self, input_ids, infer=False):
+        bsz = input_ids.shape[0]
+        mask = input_ids[:, 1:] == self.seg_token_idx
+        next1 = torch.cat(
+            [
+                input_ids[:, 2:] == 313,
+                torch.zeros((bsz, 1), dtype=torch.bool, device=input_ids.device),
+            ],
+            dim=1,
+        )
+        next2 = torch.cat(
+            [
+                input_ids[:, 3:] == 2382,
+                torch.zeros((bsz, 2), dtype=torch.bool, device=input_ids.device),
+            ],
+            dim=1,
+        )
+        mask_img1 = torch.cat(
+            [
+                input_ids[:, 4:] == 29896,
+                torch.zeros((bsz, 3), dtype=torch.bool, device=input_ids.device),
+            ],
+            dim=1,
+        )
+        mask_img2 = torch.cat(
+            [
+                input_ids[:, 4:] == 29906,
+                torch.zeros((bsz, 3), dtype=torch.bool, device=input_ids.device),
+            ],
+            dim=1,
+        )
+        mask_img1 = mask & next1 & next2 & mask_img1
+        mask_img2 = mask & next1 & next2 & mask_img2
+        if not infer:
+            mask_img1 = torch.cat(
+                [
+                    torch.zeros((bsz, 255 * 2), device=input_ids.device).bool(),
+                    mask_img1,
+                    torch.zeros((bsz, 1), device=input_ids.device).bool(),
+                ],
+                dim=1,
+            )
+            mask_img2 = torch.cat(
+                [
+                    torch.zeros((bsz, 255 * 2), device=input_ids.device).bool(),
+                    mask_img2,
+                    torch.zeros((bsz, 1), device=input_ids.device).bool(),
+                ],
+                dim=1,
+            )
+        else:
+            mask_img1 = torch.cat(
+                [
+                    torch.zeros((bsz, 255 * 2), device=input_ids.device).bool(),
+                    mask_img1,
+                ],
+                dim=1,
+            )
+            mask_img2 = torch.cat(
+                [
+                    torch.zeros((bsz, 255 * 2), device=input_ids.device).bool(),
+                    mask_img2,
+                ],
+                dim=1,
+            )
+        return mask_img1, mask_img2
+
+    def _inference_path(
+        self,
+        input_ids,
+        global_enc_images,
+        attention_masks,
+        image_offset,
+    ):
+        length = input_ids.shape[0]
+        global_enc_images_extended = global_enc_images.unsqueeze(0)
+        if length > 1:
+            global_enc_images_extended = global_enc_images_extended.repeat(
+                length, 1, 1, 1, 1
+            )
+
+        # Process and return inference output
+        output_hidden_states = []
+        for i in range(input_ids.shape[0]):
+            output_i = super().forward(
+                images=global_enc_images_extended[i : i + 1].squeeze(0),
+                attention_mask=attention_masks[i : i + 1],
+                input_ids=input_ids[i : i + 1],
+                output_hidden_states=True,
+                image_offset=image_offset,
+            )
+            output_hidden_states.append(output_i.hidden_states)
+            torch.cuda.empty_cache()
+
+        output_hidden_states = torch.cat(output_hidden_states, dim=0)
+        output_hidden_states = [output_hidden_states]
+        return output_hidden_states
+
+    def _training_path(
+        self,
+        global_enc_images,
+        input_ids,
+        labels,
+        attention_masks,
+        offset,
+        image_offset,
+    ):
+        if global_enc_images is not None:
+            global_enc_images, image_offset = self._prepare_global_enc_image(
+                global_enc_images, offset, image_offset
+            )
+
+        output = super().forward(
+            images=global_enc_images,
+            attention_mask=attention_masks,
+            input_ids=input_ids,
+            labels=labels,
+            output_hidden_states=True,
+            image_offset=image_offset,
+        )
+        output_hidden_states = output.hidden_states
+        return output, output_hidden_states
+
+    def _prepare_global_enc_image(self, global_enc_image, offset, image_offset):
+        global_enc_image_list = []
+        new_image_offset = [0]
+        img_cnt = 0
+        for i in range(len(offset) - 1):
+            start_i, end_i = offset[i], offset[i + 1]
+            img_start_i, img_end_i = image_offset[i].item(), image_offset[i + 1].item()
+            global_enc_image_i = global_enc_image[img_start_i:img_end_i].contiguous()
+            if end_i - start_i > 1:
+                global_enc_image_i = global_enc_image_i.repeat(end_i - start_i, 1, 1, 1)
+            global_enc_image_list.append(global_enc_image_i)
+            for _ in range(end_i - start_i):
+                new_image_offset.append(img_cnt := img_cnt + (img_end_i - img_start_i))
+        return torch.cat(global_enc_image_list, dim=0), torch.as_tensor(
+            new_image_offset, device=image_offset.device
+        )
+
+    def _process_hidden_states_multi(
+        self, output_hidden_states, seg_token_mask, offset, infer=False
+    ):
+        hidden_states = [self.model.text_hidden_fcs[0](output_hidden_states[-1])]
+        last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
+        all_pred_embeddings_lists = []
+        for img_idx in range(2):
+            pred_embeddings = last_hidden_state[seg_token_mask[img_idx]]
+            seg_token_counts = seg_token_mask[img_idx].int().sum(-1)
+
+            seg_token_offset = seg_token_counts.cumsum(-1)
+            seg_token_offset = torch.cat(
+                [
+                    torch.zeros(1, device=seg_token_offset.device).long(),
+                    seg_token_offset,
+                ],
+                dim=0,
+            )
+            if not infer:
+                seg_token_offset = seg_token_offset[offset]
+
+            pred_embeddings_list = []
+            for i in range(len(seg_token_offset) - 1):
+                start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
+                pred_embeddings_list.append(pred_embeddings[start_i:end_i])
+            all_pred_embeddings_lists.append(pred_embeddings_list)
+        return hidden_states, all_pred_embeddings_lists  # [[], [seg, seg seg]]
+
+    def _generate_and_postprocess_masks_multi(
+        self,
+        pred_embeddings,
+        image_embeddings,
+        resize_list,
+        label_list,
+        image_offset,
+        infer=False,
+    ):
+        all_pred_masks = []
+        for image_idx in range(2):
+            pred_masks = []
+            for i, pred_embedding in enumerate(pred_embeddings[image_idx]):
+                sparse_embeddings, dense_embeddings = (
+                    self.model.grounding_encoder.prompt_encoder(
+                        points=None,
+                        boxes=None,
+                        masks=None,
+                        text_embeds=pred_embedding.unsqueeze(1),
+                    )
+                )
+                sparse_embeddings = sparse_embeddings.to(pred_embedding.dtype)
+                low_res_masks, _ = self.model.grounding_encoder.mask_decoder(
+                    image_embeddings=image_embeddings[
+                        image_offset[i] + image_idx
+                    ].unsqueeze(0),
+                    image_pe=self.model.grounding_encoder.prompt_encoder.get_dense_pe(),
+                    sparse_prompt_embeddings=sparse_embeddings,
+                    dense_prompt_embeddings=dense_embeddings,
+                    multimask_output=False,
+                )
+                orig_size = (
+                    label_list[i][image_idx].shape
+                    if not infer
+                    else label_list[i][image_idx]
+                )
+                # During inference, we have original size list in place of label list
+                pred_mask = self.model.grounding_encoder.postprocess_masks(
+                    low_res_masks,
+                    input_size=resize_list[i][image_idx],
+                    original_size=orig_size,
+                )
+                pred_masks.append(pred_mask[:, 0])
+            all_pred_masks.append(pred_masks)
+        return tuple(all_pred_masks)
+
+    def _compute_loss_components_multi(self, pred_masks, masks_list, output):
+        # Initialize loss components
+        ce_loss = output.loss * self.ce_loss_weight
+        image_losses = torch.tensor(0.0, device=ce_loss.device)
+
+        # Iterate over batch and compute mask-related losses
+        for img_idx in range(2):
+            num_masks = 0
+            mask_bce_loss = torch.tensor(0.0, device=ce_loss.device)
+            mask_dice_loss = torch.tensor(0.0, device=ce_loss.device)
+            for batch_idx, pred_mask in enumerate(pred_masks[img_idx]):
+                if pred_mask is None:
+                    assert (
+                        masks_list[batch_idx][img_idx] is None
+                    ), "no prediction but ground truth mask available"
+                    continue
+                if pred_mask.numel() > 0:  # Ensure pred_mask is not empty
+                    gt_mask = masks_list[batch_idx][img_idx].to(pred_mask.device)
+                    # Resize gt_mask to match pred_mask if needed
+                    if gt_mask.shape[0] != pred_mask.shape[0]:
+                        gt_mask = gt_mask[: pred_mask.shape[0]]
+
+                    assert (
+                        gt_mask.shape[0] == pred_mask.shape[0]
+                    ), f"Shape mismatch: gt_mask {gt_mask.shape}, pred_mask {pred_mask.shape}"
+
+                    # Compute Binary Cross-Entropy Loss
+                    mask_bce_loss += (
+                        sigmoid_ce_loss(pred_mask, gt_mask, mask_count=gt_mask.shape[0])
+                        * gt_mask.shape[0]
+                    )
+                    # Compute Dice Loss
+                    mask_dice_loss += (
+                        dice_loss(pred_mask, gt_mask, mask_count=gt_mask.shape[0])
+                        * gt_mask.shape[0]
+                    )
+                    num_masks += gt_mask.shape[0]
+            # Normalize the losses
+            mask_bce_loss = self.bce_loss_weight * mask_bce_loss / (num_masks + 1e-8)
+            mask_dice_loss = self.dice_loss_weight * mask_dice_loss / (num_masks + 1e-8)
+
+            image_losses += mask_bce_loss + mask_dice_loss
+
+        mask_loss = image_losses / 2
+
+        # Aggregate all loss components
+        total_loss = ce_loss + mask_loss
+        return {
+            "loss": total_loss,
             "ce_loss": ce_loss,
             "mask_bce_loss": mask_bce_loss,
             "mask_dice_loss": mask_dice_loss,
