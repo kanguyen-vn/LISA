@@ -5,11 +5,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import BitsAndBytesConfig, CLIPVisionModel
 
-from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
-                         DEFAULT_IMAGE_PATCH_TOKEN)
+from utils.utils import (
+    DEFAULT_IM_END_TOKEN,
+    DEFAULT_IM_START_TOKEN,
+    DEFAULT_IMAGE_PATCH_TOKEN,
+    IMAGE_TOKEN_INDEX,
+)
 
-from .llava.model.language_model.llava_llama import (LlavaLlamaForCausalLM,
-                                                     LlavaLlamaModel)
+from .llava.model.language_model.llava_llama import (
+    LlavaLlamaForCausalLM,
+    LlavaLlamaModel,
+)
 from .segment_anything import build_sam_vit_h
 
 
@@ -136,8 +142,10 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             self.bce_loss_weight = kwargs.pop("bce_loss_weight", None)
         else:
             config.mm_vision_tower = config.vision_tower
-            
+
         self.seg_token_idx = kwargs.pop("seg_token_idx")
+        self.seg_image_tokens = kwargs.pop("seg_image_tokens")
+        self.img_emb_len = 256
 
         super().__init__(config)
 
@@ -166,6 +174,69 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             return super().forward(**kwargs)
         return self.model_forward(**kwargs)
 
+    def _create_shifted_mask(input_ids, shift, token_idx, bsz):
+        padding = shift - 1
+        return torch.cat(
+            [
+                input_ids[:, shift:] == token_idx,
+                torch.zeros((bsz, padding), dtype=torch.bool, device=input_ids.device),
+            ],
+            dim=1,
+        )
+
+    def _create_seg_token_mask_multi(self, input_ids, infer=False):
+        image_idx = 0
+        masks = []
+        bsz = input_ids.shape[0]
+        while image_idx < len(self.seg_image_tokens):
+            mask = input_ids[:, 1:] == self.seg_token_idx
+            for idx, token_idx in enumerate(self.seg_image_tokens[image_idx][1:]):
+                mask &= self._create_shifted_mask(input_ids, idx + 2, token_idx, bsz)
+            if torch.all(mask == False):
+                break
+            masks.append(mask)
+            image_idx += 1
+
+        img_count = (input_ids == IMAGE_TOKEN_INDEX).sum(dim=1)
+        new_masks = []
+        for batch_idx in range(bsz):
+            mask = masks[batch_idx]
+            mask = torch.cat(
+                [
+                    torch.zeros(
+                        (self.img_emb_len - 1) * img_count[batch_idx],
+                        device=input_ids.device,
+                    ).bool(),
+                    mask,
+                ]
+            )
+            if not infer:
+                mask = torch.cat(
+                    (mask, torch.zeros(1, device=input_ids.device).bool()), dim=1
+                )
+            new_masks.append(mask)
+
+        if any(x.shape != new_masks[0].shape for x in new_masks):
+            max_len = max(x.shape[0] for x in new_masks)
+
+            new_masks_align = []
+            for cur_new_mask in new_masks:
+                cur_new_mask = torch.cat(
+                    (
+                        cur_new_mask,
+                        torch.zeros(
+                            (max_len - cur_new_mask.shape[0], cur_new_mask.shape[1]),
+                            dtype=cur_new_mask.dtype,
+                            device=cur_new_mask.device,
+                        ),
+                    ),
+                    dim=0,
+                )
+                new_masks_align.append(cur_new_mask)
+            new_masks = new_masks_align
+
+        return new_masks
+
     def model_forward(
         self,
         images: torch.FloatTensor,
@@ -174,6 +245,7 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         labels: torch.LongTensor,
         attention_masks: torch.LongTensor,
         offset: torch.LongTensor,
+        image_offset: torch.LongTensor,
         masks_list: List[torch.FloatTensor],
         label_list: List[torch.Tensor],
         resize_list: List[tuple],
@@ -181,22 +253,23 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         **kwargs,
     ):
         image_embeddings = self.get_visual_embs(images)
-        batch_size = image_embeddings.shape[0]
-        assert batch_size == len(offset) - 1
+        # batch_size = image_embeddings.shape[0]
+        # assert batch_size == len(image_offset) - 1
 
-        seg_token_mask = input_ids[:, 1:] == self.seg_token_idx
-        seg_token_mask = torch.cat(
-            [
-                seg_token_mask,
-                torch.zeros((seg_token_mask.shape[0], 1)).bool().cuda(),
-            ],
-            dim=1,
-        )
-        # hack for IMAGE_TOKEN_INDEX (we suppose that there is only one image, and it is in the front)
-        seg_token_mask = torch.cat(
-            [torch.zeros((seg_token_mask.shape[0], 255)).bool().cuda(), seg_token_mask],
-            dim=1,
-        )
+        # seg_token_mask = input_ids[:, 1:] == self.seg_token_idx
+        # seg_token_mask = torch.cat(
+        #     [
+        #         seg_token_mask,
+        #         torch.zeros((seg_token_mask.shape[0], 1)).bool().cuda(),
+        #     ],
+        #     dim=1,
+        # )
+        # # hack for IMAGE_TOKEN_INDEX (we suppose that there is only one image, and it is in the front)
+        # seg_token_mask = torch.cat(
+        #     [torch.zeros((seg_token_mask.shape[0], 255)).bool().cuda(), seg_token_mask],
+        #     dim=1,
+        # )
+        seg_token_masks = self._create_seg_token_mask_multi(input_ids, inference)
 
         if inference:
             n_batch = 1
@@ -224,14 +297,21 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
 
         else:
             images_clip_list = []
-            for i in range(len(offset) - 1):
+            # for i in range(len(offset) - 1):
+            #     start_i, end_i = offset[i], offset[i + 1]
+            #     images_clip_i = (
+            #         images_clip[i]
+            #         .unsqueeze(0)
+            #         .expand(end_i - start_i, -1, -1, -1)
+            #         .contiguous()
+            #     )
+            #     images_clip_list.append(images_clip_i)
+            for i in range(len(image_offset) - 1):
                 start_i, end_i = offset[i], offset[i + 1]
-                images_clip_i = (
-                    images_clip[i]
-                    .unsqueeze(0)
-                    .expand(end_i - start_i, -1, -1, -1)
-                    .contiguous()
-                )
+                image_start_i, image_end_i = image_offset[i], image_offset[i + 1]
+                images_clip_i = images_clip[image_start_i:image_end_i].contiguous()
+                if end_i - start_i > 1:
+                    images_clip_i = images_clip_i.repeat(end_i - start_i, 1, 1, 1)
                 images_clip_list.append(images_clip_i)
             images_clip = torch.cat(images_clip_list, dim=0)
 
@@ -250,48 +330,56 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
         hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states[-1]))
 
         last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
-        pred_embeddings = last_hidden_state[seg_token_mask]
-        seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
 
-        seg_token_offset = seg_token_counts.cumsum(-1)
-        seg_token_offset = torch.cat(
-            [torch.zeros(1).long().cuda(), seg_token_offset], dim=0
-        )
+        all_pred_embeddings = []
+        for seg_token_mask in seg_token_masks:
+            pred_embeddings = last_hidden_state[seg_token_mask]
+            seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
 
-        seg_token_offset = seg_token_offset[offset]
+            seg_token_offset = seg_token_counts.cumsum(-1)
+            seg_token_offset = torch.cat(
+                [torch.zeros(1).long().cuda(), seg_token_offset], dim=0
+            )
 
-        pred_embeddings_ = []
-        for i in range(len(seg_token_offset) - 1):
-            start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
-            pred_embeddings_.append(pred_embeddings[start_i:end_i])
-        pred_embeddings = pred_embeddings_
+            if not inference:
+                seg_token_offset = seg_token_offset[offset]
+
+            pred_embeddings_ = []
+            for i in range(len(seg_token_offset) - 1):
+                start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
+                pred_embeddings_.append(pred_embeddings[start_i:end_i])
+            pred_embeddings = pred_embeddings_
+            all_pred_embeddings.append(pred_embeddings)
 
         multimask_output = False
-        pred_masks = []
-        for i in range(len(pred_embeddings)):
-            (
-                sparse_embeddings,
-                dense_embeddings,
-            ) = self.model.visual_model.prompt_encoder(
-                points=None,
-                boxes=None,
-                masks=None,
-                text_embeds=pred_embeddings[i].unsqueeze(1),
-            )
-            sparse_embeddings = sparse_embeddings.to(pred_embeddings[i].dtype)
-            low_res_masks, iou_predictions = self.model.visual_model.mask_decoder(
-                image_embeddings=image_embeddings[i].unsqueeze(0),
-                image_pe=self.model.visual_model.prompt_encoder.get_dense_pe(),
-                sparse_prompt_embeddings=sparse_embeddings,
-                dense_prompt_embeddings=dense_embeddings,
-                multimask_output=multimask_output,
-            )
-            pred_mask = self.model.visual_model.postprocess_masks(
-                low_res_masks,
-                input_size=resize_list[i],
-                original_size=label_list[i].shape,
-            )
-            pred_masks.append(pred_mask[:, 0])
+        all_pred_masks = []
+        for pred_embeddings in all_pred_embeddings:
+            pred_masks = []
+            for i in range(len(pred_embeddings)):
+                (
+                    sparse_embeddings,
+                    dense_embeddings,
+                ) = self.model.visual_model.prompt_encoder(
+                    points=None,
+                    boxes=None,
+                    masks=None,
+                    text_embeds=pred_embeddings[i].unsqueeze(1),
+                )
+                sparse_embeddings = sparse_embeddings.to(pred_embeddings[i].dtype)
+                low_res_masks, iou_predictions = self.model.visual_model.mask_decoder(
+                    image_embeddings=image_embeddings[i].unsqueeze(0),
+                    image_pe=self.model.visual_model.prompt_encoder.get_dense_pe(),
+                    sparse_prompt_embeddings=sparse_embeddings,
+                    dense_prompt_embeddings=dense_embeddings,
+                    multimask_output=multimask_output,
+                )
+                pred_mask = self.model.visual_model.postprocess_masks(
+                    low_res_masks,
+                    input_size=resize_list[i],
+                    original_size=label_list[i].shape,
+                )
+                pred_masks.append(pred_mask[:, 0])
+            all_pred_masks.append(pred_masks)
 
         model_output = output
         gt_masks = masks_list

@@ -15,10 +15,16 @@ from torch.utils.tensorboard import SummaryWriter
 
 from model.LISA import LISAForCausalLM
 from model.llava import conversation as conversation_lib
-from utils.dataset import HybridDataset, ValDataset, collate_fn
-from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
-                         AverageMeter, ProgressMeter, Summary, dict_to_cuda,
-                         intersectionAndUnionGPU)
+from utils.dataset import HybridDataset, ValDataset, collate_fn_multi as collate_fn
+from utils.utils import (
+    DEFAULT_IM_END_TOKEN,
+    DEFAULT_IM_START_TOKEN,
+    AverageMeter,
+    ProgressMeter,
+    Summary,
+    dict_to_cuda,
+    intersectionAndUnionGPU,
+)
 
 
 def parse_args(args):
@@ -36,7 +42,9 @@ def parse_args(args):
         help="precision for inference",
     )
     parser.add_argument("--image_size", default=1024, type=int, help="image size")
-    parser.add_argument("--model_max_length", default=512, type=int)
+    parser.add_argument(
+        "--model_max_length", default=1780, type=int
+    )  # TODO: Reduce after examining input_ids size
     parser.add_argument("--lora_r", default=8, type=int)
     parser.add_argument(
         "--vision-tower", default="openai/clip-vit-large-patch14", type=str
@@ -125,7 +133,16 @@ def main(args):
     )
     tokenizer.pad_token = tokenizer.unk_token
     num_added_tokens = tokenizer.add_tokens("[SEG]")
+    num_added_tokens = tokenizer.add_tokens("<p>")
+    num_added_tokens = tokenizer.add_tokens("</p>")
     args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
+
+    max_image_count = args.model_max_length // 256
+    args.seg_image_tokens = []
+    for i in range(max_image_count):
+        args.seg_image_tokens.append(
+            tokenizer(f"[SEG] (IMAGE{i + 1})", add_special_tokens=False).input_ids
+        )
 
     if args.use_mm_start_end:
         tokenizer.add_tokens(
@@ -142,6 +159,7 @@ def main(args):
         "vision_pretrained": args.vision_pretrained,
         "vision_tower": args.vision_tower,
         "use_mm_start_end": args.use_mm_start_end,
+        "seg_image_tokens": args.seg_image_tokens,
     }
     torch_dtype = torch.float32
     if args.precision == "bf16":
@@ -217,15 +235,15 @@ def main(args):
     model.resize_token_embeddings(len(tokenizer))
 
     # make text_hidden_fcs, mask_decoder, lm_head, embed_tokens trainable
-    for n, p in model.named_parameters():
-        if any(
-            [
-                x in n
-                for x in ["lm_head", "embed_tokens", "mask_decoder", "text_hidden_fcs"]
-            ]
-        ):
-            print("n: ", n, "p.shape: ", p.shape)
-            p.requires_grad = True
+    # for n, p in model.named_parameters():
+    #     if any(
+    #         [
+    #             x in n
+    #             for x in ["lm_head", "embed_tokens", "mask_decoder", "text_hidden_fcs"]
+    #         ]
+    #     ):
+    #         print("n: ", n, "p.shape: ", p.shape)
+    #         p.requires_grad = True
 
     world_size = torch.cuda.device_count()
     args.distributed = world_size > 1

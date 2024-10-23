@@ -323,13 +323,13 @@ class SemSegDataset(torch.utils.data.Dataset):
                 masks.append(label == class_id)
             masks = torch.stack(masks, dim=0)
         return (
-            image_path,
-            image,
-            image_clip,
-            conversations,
-            masks,
-            label,
-            resize,
-            questions,
-            sampled_classes,
+            image_path,  # tuple(image_paths)
+            image,  # N x 3 x h x w
+            image_clip,  # N x 3 x h x w
+            conversations,  # list(str)
+            masks,  # list(N x h x w)
+            label,  # list(h x w)
+            resize,  # list(h x w)
+            questions,  # list(str)
+            sampled_classes,  # list(str)
         )
