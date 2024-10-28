@@ -150,14 +150,67 @@ class ProgressMeter(object):
         return "[" + fmt + "/" + fmt.format(num_batches) + "]"
 
 
+# def dict_to_cuda(input_dict):
+#     for k, v in input_dict.items():
+#         if isinstance(input_dict[k], torch.Tensor):
+#             input_dict[k] = v.cuda(non_blocking=True)
+#         elif (
+#             isinstance(input_dict[k], list)
+#             and len(input_dict[k]) > 0
+#             and isinstance(input_dict[k][0], torch.Tensor)
+#         ):
+#             input_dict[k] = [ele.cuda(non_blocking=True) for ele in v]
+#     return input_dict
+
+
+def to_cuda(e):
+    return (
+        e.cuda(non_blocking=True)
+        if e is not None and not isinstance(e, (str, int))
+        else e
+    )
+
+
 def dict_to_cuda(input_dict):
     for k, v in input_dict.items():
-        if isinstance(input_dict[k], torch.Tensor):
-            input_dict[k] = v.cuda(non_blocking=True)
-        elif (
-            isinstance(input_dict[k], list)
-            and len(input_dict[k]) > 0
-            and isinstance(input_dict[k][0], torch.Tensor)
-        ):
-            input_dict[k] = [ele.cuda(non_blocking=True) for ele in v]
+        if isinstance(v, torch.Tensor):
+            input_dict[k] = to_cuda(v)
+        elif isinstance(input_dict[k], list):
+            input_dict[k] = list_to_cuda(input_dict[k])
+        elif isinstance(input_dict[k], tuple):
+            input_dict[k] = tuple_to_cuda(input_dict[k])
+        elif isinstance(v, dict):
+            input_dict[k] = dict_to_cuda(v)
     return input_dict
+
+
+def list_to_cuda(input_list):
+    for i in range(len(input_list)):
+        if isinstance(input_list[i], torch.Tensor):
+            input_list[i] = to_cuda(input_list[i])
+        elif isinstance(input_list[i], dict):
+            input_list[i] = dict_to_cuda(input_list[i])
+        elif isinstance(input_list[i], list):
+            input_list[i] = list_to_cuda(input_list[i])
+        elif isinstance(input_list[i], tuple):
+            input_list[i] = tuple_to_cuda(input_list[i])
+    return input_list
+
+
+def tuple_to_cuda(input_tuple):
+    return tuple(
+        (
+            to_cuda(e)
+            if isinstance(e, torch.Tensor)
+            else (
+                dict_to_cuda(e)
+                if isinstance(e, dict)
+                else (
+                    list_to_cuda(e)
+                    if isinstance(e, list)
+                    else tuple_to_cuda(e) if isinstance(e, tuple) else e
+                )
+            )
+        )
+        for e in input_tuple
+    )

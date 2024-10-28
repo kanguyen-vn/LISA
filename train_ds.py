@@ -141,7 +141,7 @@ def main(args):
     args.seg_image_tokens = []
     for i in range(max_image_count):
         args.seg_image_tokens.append(
-            tokenizer(f"[SEG] (IMAGE{i + 1})", add_special_tokens=False).input_ids
+            tokenizer(f"[SEG] (IMAGE{i + 1}", add_special_tokens=False).input_ids
         )
 
     if args.use_mm_start_end:
@@ -235,15 +235,16 @@ def main(args):
     model.resize_token_embeddings(len(tokenizer))
 
     # make text_hidden_fcs, mask_decoder, lm_head, embed_tokens trainable
-    # for n, p in model.named_parameters():
-    #     if any(
-    #         [
-    #             x in n
-    #             for x in ["lm_head", "embed_tokens", "mask_decoder", "text_hidden_fcs"]
-    #         ]
-    #     ):
-    #         print("n: ", n, "p.shape: ", p.shape)
-    #         p.requires_grad = True
+    for n, p in model.named_parameters():
+        if any(
+            [
+                x in n
+                # for x in ["lm_head", "embed_tokens", "mask_decoder", "text_hidden_fcs"]
+                for x in ["mask_decoder"]
+            ]
+        ):
+            print("n: ", n, "p.shape: ", p.shape)
+            p.requires_grad = True
 
     world_size = torch.cuda.device_count()
     args.distributed = world_size > 1

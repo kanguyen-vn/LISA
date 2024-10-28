@@ -174,68 +174,94 @@ class LISAForCausalLM(LlavaLlamaForCausalLM):
             return super().forward(**kwargs)
         return self.model_forward(**kwargs)
 
-    def _create_shifted_mask(input_ids, shift, token_idx, bsz):
+    def _create_shifted_mask(self, input_ids, shift, token_idx):
+        bsz = input_ids.shape[0]
         padding = shift - 1
+        new_mask = input_ids[:, shift:] == token_idx
+        if padding == 0:
+            return new_mask
         return torch.cat(
             [
-                input_ids[:, shift:] == token_idx,
+                new_mask,
                 torch.zeros((bsz, padding), dtype=torch.bool, device=input_ids.device),
             ],
             dim=1,
         )
 
-    def _create_seg_token_mask_multi(self, input_ids, infer=False):
+    def _create_seg_token_mask_multi(
+        self, input_ids, qformer_attention_masks, seg_only=False, infer=False
+    ):
         image_idx = 0
-        masks = []
+        all_masks = []
         bsz = input_ids.shape[0]
-        while image_idx < len(self.seg_image_tokens):
-            mask = input_ids[:, 1:] == self.seg_token_idx
-            for idx, token_idx in enumerate(self.seg_image_tokens[image_idx][1:]):
-                mask &= self._create_shifted_mask(input_ids, idx + 2, token_idx, bsz)
-            if torch.all(mask == False):
-                break
-            masks.append(mask)
-            image_idx += 1
+        for image_idx in range(len(self.seg_image_tokens[:5])):
+            mask = torch.ones_like(input_ids[:, 1:], device=input_ids.device).bool()
+            if not seg_only:
+                for idx, token_idx in enumerate(self.seg_image_tokens[image_idx]):
+                    shifted_mask = self._create_shifted_mask(
+                        input_ids, idx + 1, token_idx
+                    )
+                    mask &= shifted_mask
+            all_masks.append(mask)
 
         img_count = (input_ids == IMAGE_TOKEN_INDEX).sum(dim=1)
-        new_masks = []
-        for batch_idx in range(bsz):
-            mask = masks[batch_idx]
-            mask = torch.cat(
-                [
-                    torch.zeros(
-                        (self.img_emb_len - 1) * img_count[batch_idx],
-                        device=input_ids.device,
-                    ).bool(),
-                    mask,
-                ]
-            )
-            if not infer:
+        qformer_query_token_count = qformer_attention_masks.sum(dim=1)
+
+        all_new_masks = []
+        for image_idx, masks in enumerate(all_masks):
+            new_masks = []
+            for batch_idx in range(bsz):
+                mask = masks[batch_idx]
                 mask = torch.cat(
-                    (mask, torch.zeros(1, device=input_ids.device).bool()), dim=1
-                )
-            new_masks.append(mask)
-
-        if any(x.shape != new_masks[0].shape for x in new_masks):
-            max_len = max(x.shape[0] for x in new_masks)
-
-            new_masks_align = []
-            for cur_new_mask in new_masks:
-                cur_new_mask = torch.cat(
-                    (
-                        cur_new_mask,
+                    [
                         torch.zeros(
-                            (max_len - cur_new_mask.shape[0], cur_new_mask.shape[1]),
-                            dtype=cur_new_mask.dtype,
-                            device=cur_new_mask.device,
-                        ),
-                    ),
+                            (
+                                self.img_emb_len
+                                + qformer_query_token_count[batch_idx]
+                                - 1
+                            )
+                            * img_count[batch_idx],
+                            device=input_ids.device,
+                        ).bool(),
+                        mask,
+                    ],
                     dim=0,
                 )
-                new_masks_align.append(cur_new_mask)
-            new_masks = new_masks_align
+                if not infer:
+                    mask = torch.cat(
+                        (mask, torch.zeros(1, device=input_ids.device).bool()), dim=0
+                    )
+                new_masks.append(mask)
 
-        return new_masks
+            if any(x.shape != new_masks[0].shape for x in new_masks):
+                max_len = max(x.shape[0] for x in new_masks)
+
+                new_masks_align = []
+                for cur_new_mask in new_masks:
+                    cur_new_mask = torch.cat(
+                        (
+                            cur_new_mask,
+                            torch.zeros(
+                                (
+                                    max_len
+                                    - cur_new_mask.shape[0]  # ,
+                                    # cur_new_mask.shape[1],
+                                ),
+                                dtype=cur_new_mask.dtype,
+                                device=cur_new_mask.device,
+                            ),
+                        ),
+                        dim=0,
+                    )
+                    new_masks_align.append(cur_new_mask)
+                new_masks = new_masks_align
+            new_masks = torch.stack(new_masks, dim=0)
+            all_new_masks.append(new_masks)
+
+        while len(all_new_masks) > 0 and torch.all(all_new_masks[-1] == False):
+            all_new_masks.pop()
+
+        return all_new_masks
 
     def model_forward(
         self,
